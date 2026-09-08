@@ -167,14 +167,44 @@ actor NativeTFTPService: TFTPServiceControlling {
     /// funciona siempre, sin ningún flag, y es lo único que esta app puede
     /// prometer hoy.
     ///
-    /// `UserName` hace que launchd baje privilegios de root al usuario actual
-    /// para el proceso `tftpd` DESPUÉS de hacer `bind()` en el puerto
-    /// privilegiado 69 (eso lo hace launchd mismo, como root, antes del
-    /// handoff — no requiere que tftpd sea root). Resultado: cancelar una
-    /// transferencia (`kill` sobre el proceso) ya no necesita otro diálogo de
-    /// autorización — el proceso es del mismo usuario que la GUI. Cambio
-    /// motivado por feedback del usuario (2026-09-04): pedir contraseña para
-    /// cancelar "no tenía sentido".
+    /// `UserName`/`GroupName` NO se especifican (2026-09-08, corrección de un
+    /// bug real encontrado en pruebas en vivo, con `curl` y con el cliente
+    /// `tftp` nativo, tanto por loopback como por IP LAN real — timeout
+    /// reproducible al 100%):
+    ///
+    /// El diseño anterior ponía `UserName` = usuario actual para que `launchd`
+    /// bajara privilegios de root al usuario de la GUI DESPUÉS de hacer
+    /// `bind()` en el puerto privilegiado 69, con la idea de que cancelar una
+    /// transferencia (`kill` sobre el proceso) no necesitara otro diálogo de
+    /// autorización (cambio motivado por feedback del usuario, 2026-09-04:
+    /// pedir contraseña para cancelar "no tenía sentido").
+    ///
+    /// Pero `/usr/libexec/tftpd` intenta él mismo, por cada petición, bajar
+    /// tanto su grupo como su usuario a `nobody` (`setgid`/`setuid` a -2) como
+    /// medida de seguridad interna — y ambas syscalls solo las puede ejecutar
+    /// un proceso que sea root de verdad. Añadir solo `GroupName` = `nobody`
+    /// resuelve el `setgid` pero no el `setuid` (sigue fallando con
+    /// "Operation not permitted" porque el proceso no es root); la única
+    /// combinación que funciona es dejar que `tftpd` arranque siendo root
+    /// completo (sin `UserName` ni `GroupName` en el plist, igual que el
+    /// `tftpd` nativo del sistema) para que sea el propio binario quien haga
+    /// el drop de privilegios internamente.
+    ///
+    /// Trade-off aceptado conscientemente: cancelar una transferencia vuelve
+    /// a pedir autorización de administrador, igual que Start/Stop.
+    ///
+    /// Orden de `ProgramArguments` (2026-09-08, segundo bug real encontrado
+    /// tras el fix de arriba): el `tftpd` de BSD/macOS usa `getopt`, que deja
+    /// de interpretar flags en cuanto encuentra el primer argumento
+    /// posicional. El orden anterior (`-i`, directorio, `-l`, `-d15`) hacía
+    /// que `-l` y `-d15` quedaran DESPUÉS del directorio, así que nunca se
+    /// interpretaban como flags — se trataban como directorios adicionales
+    /// (inválidos), y la restricción de acceso terminaba rota: toda petición
+    /// devolvía "File not found" aunque el archivo existiera y fuera
+    /// legible. Además `-d15` es sintaxis de `tftpd` de Linux (verbosidad
+    /// numérica); el `-d` de este `tftpd` no acepta argumento (confirmado en
+    /// `man tftpd`). Todos los flags van ahora antes del directorio, y `-d`
+    /// va solo.
     private static func plistContents(root: URL) -> String {
         return """
         <?xml version="1.0" encoding="UTF-8"?>
@@ -183,15 +213,13 @@ actor NativeTFTPService: TFTPServiceControlling {
         <dict>
             <key>Label</key>
             <string>\(ownLabel)</string>
-            <key>UserName</key>
-            <string>\(xmlEscaped(NSUserName()))</string>
             <key>ProgramArguments</key>
             <array>
                 <string>/usr/libexec/tftpd</string>
+                <string>-l</string>
+                <string>-d</string>
                 <string>-i</string>
                 <string>\(xmlEscaped(root.path))</string>
-                <string>-l</string>
-                <string>-d15</string>
             </array>
             <key>Sockets</key>
             <dict>

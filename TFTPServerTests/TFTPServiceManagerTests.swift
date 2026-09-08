@@ -97,3 +97,22 @@ final class TFTPServiceManagerTests: XCTestCase {
         }
     }
 }
+
+/// Bug real encontrado en vivo (2026-09-08): ver `ProcessLiveness` (en
+/// `ProcessKiller.swift`) para el bug que motiva esto — usar la ausencia de
+/// datos de `nettop` como única señal de "el proceso terminó" dejaba tareas
+/// de sondeo huérfanas para siempre cuando `tftpd` corre como root.
+final class ProcessLivenessTests: XCTestCase {
+    func testDetectsOwnProcessAsAlive() {
+        XCTAssertTrue(ProcessLiveness.isAlive(pid: ProcessInfo.processInfo.processIdentifier))
+    }
+
+    func testDetectsImpossiblePIDAsNotAlive() {
+        // PID 2 es tradicionalmente el proceso `kthreadd` en Linux o
+        // reservado en el kernel — nunca es asignable a un proceso de
+        // usuario nuevo, así que un valor claramente fuera de rango es más
+        // seguro: el máximo teórico de `pid_t` casi con certeza no está en
+        // uso.
+        XCTAssertFalse(ProcessLiveness.isAlive(pid: Int32.max - 1))
+    }
+}

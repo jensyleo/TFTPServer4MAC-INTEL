@@ -155,15 +155,32 @@ struct DetectingTransfersPanel: View {
             VStack(alignment: .leading, spacing: 8) {
                 Label("Detecting \(transfers.count) transfer\(transfers.count == 1 ? "" : "s")…", systemImage: "arrow.up.arrow.down.circle")
                     .font(.caption.weight(.medium))
-                ForEach(transfers) { transfer in
-                    TransferCard(transfer: transfer)
+
+                // Mismo bug real que en `ActiveTransfersPanel` (ver su
+                // comentario), pero encontrado aquí en vivo (2026-09-08) con
+                // muchas transferencias sin resolver dirección a la vez
+                // (rondas de pruebas sucesivas): sin `ScrollView`/tope de
+                // altura, la lista crecía sin límite y empujaba el botón
+                // "Done" fuera de la ventana — sin scroll disponible, quedaba
+                // inalcanzable por completo, no solo cortado.
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 8) {
+                        ForEach(transfers) { transfer in
+                            TransferCard(transfer: transfer)
+                        }
+                    }
+                    .padding(.bottom, 4)
                 }
+                .frame(maxHeight: 380)
+
                 if allTransfersFinished {
+                    Divider()
                     HStack {
                         Spacer()
                         Button("Done") {
                             appState.dismissAllFinishedTransfers(direction: nil)
                         }
+                        .keyboardShortcut(.defaultAction)
                     }
                 }
             }

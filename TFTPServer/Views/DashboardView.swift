@@ -47,6 +47,12 @@ struct DashboardView: View {
                     Label("Change Path", systemImage: "folder.badge.gearshape")
                         .labelStyle(.titleAndIcon)
                 }
+                .disabled(appState.serverStatus == .running)
+                .help(
+                    appState.serverStatus == .running
+                        ? "Stop the server first — it keeps serving the current folder until restarted, so changing it here wouldn't take effect."
+                        : "Choose the folder the server reads from and writes to. A folder inside your personal home folder (/Users/yourname/…) needs a one-time permission fix — the app will detect it and offer a \"Fix\" button."
+                )
 
                 Button {
                     NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: appState.configuration.rootDirectory.path)

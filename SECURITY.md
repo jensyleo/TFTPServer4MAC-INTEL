@@ -8,6 +8,7 @@ TFTP (RFC 1350) predates modern network security entirely. It has:
 - **No encryption.** File contents, filenames, and all protocol traffic are sent in plaintext.
 - **No overwrite confirmation.** If a write request targets a file that already exists and is writable, the daemon overwrites it immediately — no warning, no confirmation, no backup.
 - **No access control beyond filesystem permissions.** Whatever the configured TFTP folder and its files allow via normal Unix permissions is what a remote device can do.
+- **No locking on concurrent writes to the same filename.** If two devices upload to the same destination filename at the same time, the native daemon does not serialize or lock the write — the file can end up with interleaved data from both transfers, silently corrupted, with no error reported to either client. Confirmed live (2026-09-08): two simultaneous uploads to one filename produced a file matching neither source past the first couple of megabytes. Simultaneous transfers to *different* filenames are unaffected — this only applies to two writers targeting the exact same name at the same time.
 
 None of this is specific to this app or to macOS's implementation — it is inherent to the 1980 protocol design.
 
@@ -15,7 +16,7 @@ None of this is specific to this app or to macOS's implementation — it is inhe
 
 - **Uploads only overwrite, never create.** There is no setting to enable uploads — the native daemon only allows overwriting a file that already exists in the TFTP folder and is writable by everyone. A device can never cause a brand-new file to appear.
 - **No persistent exposure.** The TFTP service is only active between Start and Stop. Stopping (including an automatic stop on quit, or an orphaned-server check on the next launch after a crash) removes the service registration entirely — nothing keeps listening in the background.
-- **Least privilege for transfers.** The actual file-transfer process runs under your own user account, not root, minimizing what a successful attack against it could reach.
+- **Time-boxed privilege only.** The transfer daemon runs as root only while the server is active — it needs to (the native `tftpd` binary requires it to drop its own privileges internally for each request; a lower-privilege launch configuration was tried and found to break every transfer, see the project's commit history) — and only for the folder you explicitly chose. Start/Stop and cancelling a transfer each require the same one-time macOS administrator authorization, so nothing privileged happens without you approving it in the moment.
 - **No telemetry, no network calls beyond the TFTP service itself.** The app makes no external connections and collects no usage data.
 - **Optional client IP visibility.** An opt-out toggle captures only the first packet of each request (never the transfer's actual data) so you can see which device is talking to the server — off requires no extra step, and turning it on before Start needs no separate authorization beyond Start's own.
 - **Folder root can't be the entire disk.** The configured TFTP folder is validated to reject the filesystem root, top-level folders, system paths, and directory traversal — a misconfiguration can never expose more than one specific folder.

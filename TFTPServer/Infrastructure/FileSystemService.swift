@@ -68,4 +68,37 @@ struct FileSystemService: Sendable {
         }
         return fileManager.isReadableFile(atPath: directory.path)
     }
+
+    /// Agrega SOLO el bit de ejecución para "otros" (`o+x`, octal `0o001`) —
+    /// nunca lectura ni escritura — sin tocar el resto de los bits
+    /// existentes. Ver `PathValidator.firstAncestorBlockingOtherTraversal`
+    /// para el bug real que esto arregla: `tftpd`, corriendo como `nobody`
+    /// tras bajar sus propios privilegios, no puede atravesar una carpeta
+    /// personal (`750` por defecto) para llegar a la carpeta TFTP elegida,
+    /// sin importar los permisos de esa subcarpeta. Este bit por sí solo
+    /// permite "pasar a través" de `directory` hacia una ruta ya conocida —
+    /// NO permite listar su contenido (`ls`) ni leer archivos sueltos que
+    /// estén directamente dentro de ella, salvo que esos archivos/carpetas
+    /// tengan además sus propios permisos de lectura para "otros". Falla (y
+    /// no hace nada) si la carpeta no existe o pertenece a otro usuario —
+    /// esta app corre como el usuario actual, sin privilegios para tocar
+    /// carpetas ajenas, y no debe pedir autorización solo para esto.
+    func repairOtherTraversal(on directory: URL) -> Bool {
+        let fileManager = FileManager.default
+        var isDirectory: ObjCBool = false
+        guard fileManager.fileExists(atPath: directory.path, isDirectory: &isDirectory), isDirectory.boolValue else {
+            return false
+        }
+        let attributes = try? fileManager.attributesOfItem(atPath: directory.path)
+        let currentMode = (attributes?[.posixPermissions] as? NSNumber)?.intValue ?? 0
+        let repairedMode = currentMode | 0o001
+        do {
+            try fileManager.setAttributes([.posixPermissions: repairedMode], ofItemAtPath: directory.path)
+        } catch {
+            return false
+        }
+        let updatedAttributes = try? fileManager.attributesOfItem(atPath: directory.path)
+        let updatedMode = (updatedAttributes?[.posixPermissions] as? NSNumber)?.intValue ?? 0
+        return updatedMode & 0o001 != 0
+    }
 }

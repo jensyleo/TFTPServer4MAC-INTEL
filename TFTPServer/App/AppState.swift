@@ -13,7 +13,30 @@ final class AppState: ObservableObject {
     /// acumular decenas de miles de entradas, degradando el `List`/`Table`
     /// que las muestra. Pedido del usuario (2026-09-08): revisar que exista
     /// algún límite, no necesariamente un toggle para desactivar el log.
-    private static let maxLogEntries = 5000
+    ///
+    /// Bug real encontrado en vivo (2026-09-08, tope bajado de 5000 a 500):
+    /// `logEntries` es `@Published` — cada mutación en el sitio (`append`,
+    /// `removeFirst`) pasa por el `_modify` sintetizado de Combine, que
+    /// mantiene su propia copia retenida del valor "actual" para publicarla
+    /// a quien esté suscrito. Eso hace que el arreglo deje de tener una
+    /// referencia única en el momento de mutarlo, forzando a Swift a copiar
+    /// el arreglo COMPLETO antes de aplicar el cambio (copy-on-write) — y
+    /// después, al reemplazar la copia retenida por Combine, la anterior
+    /// (ya sin más referencias) se destruye por completo, liberando cada
+    /// `LogEntry` uno por uno. Confirmado con `sample`: con el tope en 5000,
+    /// la pila del hilo principal mostraba cientos de miles de instancias en
+    /// `_ContiguousArrayStorage.__deallocating_deinit` / `destroy for
+    /// LogEntry`, sostenidas por minutos tras una sesión de pruebas con
+    /// muchas transferencias — la app dejaba de responder y de mostrar su
+    /// ventana por completo, forzando un Force Quit real. Este costo es por
+    /// mutación, no por línea seguida — de ahí que agrupar líneas en un solo
+    /// lote (`AppState.handleActivityLines`) no bastara por sí solo: cada
+    /// lote seguía pagando el costo de copiar/destruir un arreglo de 5000
+    /// elementos. Con el tope en 500 (10 veces más chico), ese costo baja
+    /// proporcionalmente — el recorte real en cuánto scrollback queda
+    /// visible en el Log Viewer es aceptable frente a dejar la app
+    /// inutilizable.
+    private static let maxLogEntries = 500
     private static let maxTransferHistory = 1000
     @Published var serverStatus: TFTPStatus = .unknown
     @Published var configuration: TFTPConfiguration
@@ -25,6 +48,13 @@ final class AppState: ObservableObject {
     @Published var logEntries: [LogEntry] = []
     @Published var workingPathPermissionsOK = true
     @Published var parentFolderPermissionsOK = true
+    /// La carpeta (algún ancestro de `configuration.rootDirectory`, desde
+    /// "/" hasta ella) a la que le falta el bit de ejecución para "otros" —
+    /// ver `PathValidator.firstAncestorBlockingOtherTraversal`. `nil` cuando
+    /// toda la cadena está bien. Casi siempre es la carpeta personal del
+    /// usuario (`/Users/<usuario>`, `750` por defecto en macOS) cuando la
+    /// carpeta TFTP elegida vive dentro de ella.
+    @Published var ancestorBlockingTraversal: URL?
     /// Una entrada por proceso `tftpd` real actualmente en curso — el daemon
     /// nativo sí atiende múltiples clientes en paralelo (confirmado en vivo,
     /// 2026-09-07), así que la app debe poder mostrarlos todos, no solo el
@@ -61,11 +91,16 @@ final class AppState: ObservableObject {
     /// Cuántas líneas del archivo de captura de IP (ver
     /// `ClientIPCaptureService`) ya se emparejaron con una transferencia —
     /// las líneas llegan aproximadamente en el mismo orden que las
-    /// detecciones de `handleActivityLine`, así que se consumen en fila
+    /// detecciones de `handleTransferDetection`, así que se consumen en fila
     /// (FIFO), no por ningún identificador compartido (no existe uno: el
     /// puerto 69 no dice nada sobre a qué PID terminará asignándose la
     /// transferencia).
     private var consumedClientIPLines = 0
+    /// Ver `handleActivityLines`/`flushPendingLogEntries` para el bug real
+    /// que motiva acumular aquí en vez de publicar directamente a
+    /// `logEntries` por cada lote de líneas del pipe.
+    private var pendingLogEntries: [LogEntry] = []
+    private var logFlushTask: Task<Void, Never>?
 
     init(serviceController: TFTPServiceController = TFTPServiceController(service: NativeTFTPService())) {
         self.serviceController = serviceController
@@ -181,6 +216,7 @@ final class AppState: ObservableObject {
         workingPathPermissionsOK = fileSystemService.hasAppropriatePermissions(configuration.rootDirectory)
         let parent = configuration.rootDirectory.deletingLastPathComponent()
         parentFolderPermissionsOK = fileSystemService.hasAppropriatePermissions(parent)
+        ancestorBlockingTraversal = PathValidator.firstAncestorBlockingOtherTraversal(configuration.rootDirectory)
     }
 
     /// Botón "Fix" junto a "Working path permissions" — feedback del usuario
@@ -209,13 +245,45 @@ final class AppState: ObservableObject {
         dismissPermissionsPromptIfResolved()
     }
 
+    /// Botón "Fix" para `ancestorBlockingTraversal` — ver
+    /// `PathValidator.firstAncestorBlockingOtherTraversal` para el bug real
+    /// que esto corrige: `tftpd`, corriendo como `nobody` tras bajar sus
+    /// propios privilegios, no puede atravesar esa carpeta para llegar a la
+    /// carpeta TFTP elegida. Solo agrega el bit de ejecución para "otros"
+    /// (`o+x`) — nunca lectura ni escritura — así que no expone el contenido
+    /// de esa carpeta, solo permite "pasar a través" de ella. No requiere
+    /// autorización porque el usuario ya es dueño de esa carpeta (falla sin
+    /// hacer nada si no lo es).
+    func repairAncestorTraversal() {
+        guard let ancestor = ancestorBlockingTraversal else { return }
+        guard fileSystemService.repairOtherTraversal(on: ancestor) else {
+            lastError = .permissionsRepairFailed
+            return
+        }
+        refreshPermissions()
+        dismissPermissionsPromptIfResolved()
+    }
+
     private func dismissPermissionsPromptIfResolved() {
-        if workingPathPermissionsOK, parentFolderPermissionsOK {
+        if workingPathPermissionsOK, parentFolderPermissionsOK, ancestorBlockingTraversal == nil {
             isShowingPermissionsNeededPrompt = false
         }
     }
 
+    /// Bug real encontrado en vivo (2026-09-08): cambiar la carpeta con el
+    /// servidor ya corriendo aceptaba el cambio en `configuration` sin
+    /// avisar que no tiene efecto real hasta un Stop/Start — el daemon ya
+    /// cargado sigue sirviendo la carpeta ANTERIOR. La UI mostraba la ruta
+    /// nueva como si ya aplicara, dando la impresión de un cambio que en
+    /// realidad no había ocurrido todavía. En vez de intentar reiniciar el
+    /// daemon en silencio aquí (heredaría el mismo problema de
+    /// autorización que Start/Stop, sin que el usuario lo pida), se bloquea
+    /// el cambio y se exige detener el servidor primero.
     func changeRootDirectory(to url: URL) {
+        guard serverStatus != .running else {
+            lastError = .cannotChangePathWhileRunning
+            return
+        }
         guard PathValidator.isValidRoot(url) else {
             lastError = .rootDirectoryInvalid
             return
@@ -224,7 +292,7 @@ final class AppState: ObservableObject {
         log(.application, "TFTP root changed to \(url.path)")
         refreshFiles()
         refreshPermissions()
-        if !workingPathPermissionsOK || !parentFolderPermissionsOK {
+        if !workingPathPermissionsOK || !parentFolderPermissionsOK || ancestorBlockingTraversal != nil {
             isShowingPermissionsNeededPrompt = true
         }
     }
@@ -246,6 +314,11 @@ final class AppState: ObservableObject {
             lastError = .permissionsMustBeFixedFirst
             return
         }
+        if ancestorBlockingTraversal != nil {
+            isShowingPermissionsNeededPrompt = true
+            lastError = .permissionsMustBeFixedFirst
+            return
+        }
 
         do {
             // `AppState.configuration` (root elegido con "Change Path", flags
@@ -258,8 +331,8 @@ final class AppState: ObservableObject {
             try await serviceController.start()
             log(.application, "Server started")
             consumedClientIPLines = 0
-            logStreamMonitor.start { [weak self] line in
-                self?.handleActivityLine(line)
+            logStreamMonitor.start { [weak self] lines in
+                self?.handleActivityLines(lines)
             }
         } catch let error as TFTPServiceError {
             lastError = error
@@ -311,8 +384,8 @@ final class AppState: ObservableObject {
             try await serviceController.restart()
             log(.application, "Server restarted to apply Show Client IP")
             consumedClientIPLines = 0
-            logStreamMonitor.start { [weak self] line in
-                self?.handleActivityLine(line)
+            logStreamMonitor.start { [weak self] lines in
+                self?.handleActivityLines(lines)
             }
         } catch let error as TFTPServiceError {
             lastError = error
@@ -353,8 +426,69 @@ final class AppState: ObservableObject {
         }
     }
 
-    private func handleActivityLine(_ line: String) {
-        log(.system, line)
+    /// Bug real encontrado en vivo (2026-09-08), en dos etapas — cada una
+    /// solo visible después de arreglar la anterior y volver a probar bajo
+    /// carga sostenida (varias rondas de transferencias encadenadas sin
+    /// pausa, no solo una):
+    ///
+    /// 1. Mutar `logEntries` (una mutación de `Array` completa, con posible
+    ///    copia) una vez POR LÍNEA recibida de `LogStreamMonitor` saturaba
+    ///    el hilo principal en cuanto `tftpd` generaba mucho volumen de
+    ///    debug (ver comentario en `LogStreamMonitor.start`). Agrupar en un
+    ///    solo lote por lectura (`append(contentsOf:)` + un recorte) redujo
+    ///    esto, pero no lo eliminó del todo.
+    /// 2. Con el lote ya agrupado, `sample` seguía mostrando el hilo
+    ///    principal atascado — esta vez dentro de
+    ///    `ObservableObjectPublisher.send()` / SwiftUI, no en el propio
+    ///    `Array`: cada publicación de `@Published logEntries` obliga a
+    ///    SwiftUI a re-evaluar las vistas suscritas (el Log Viewer). Bajo
+    ///    varias rondas de transferencias encadenadas sin pausa, las
+    ///    publicaciones llegan más rápido de lo que SwiftUI logra
+    ///    procesarlas, y el atraso se acumula sin límite — memoria y CPU
+    ///    subiendo sin parar, la app dejando de responder por completo (a
+    ///    diferencia del bug anterior, que sí se resolvía solo en unos
+    ///    segundos, este NO se recuperaba, requiriendo Force Quit real).
+    ///
+    /// La detección de transferencias (`handleTransferDetection`, barata,
+    /// ya con el filtro de substring antes del regex) sigue corriendo de
+    /// inmediato por línea — solo lo que llega al arreglo `@Published`
+    /// visible se acumula en `pendingLogEntries` y se publica en lotes a
+    /// una frecuencia fija (`flushPendingLogEntries`, cada ~200ms), en vez
+    /// de una vez por cada lote de líneas del pipe. Esto desacopla "qué tan
+    /// rápido llegan las líneas" de "qué tan seguido tiene que redibujar
+    /// SwiftUI" — la tasa de publicación queda acotada sin importar cuánto
+    /// genere `tftpd`.
+    private func handleActivityLines(_ lines: [String]) {
+        guard !lines.isEmpty else { return }
+
+        for line in lines {
+            pendingLogEntries.append(LogEntry(date: Date(), source: .system, message: line))
+            handleTransferDetection(in: line)
+        }
+        ensureLogFlushLoopRunning()
+    }
+
+    private func flushPendingLogEntries() {
+        guard !pendingLogEntries.isEmpty else { return }
+        logEntries.append(contentsOf: pendingLogEntries)
+        pendingLogEntries.removeAll(keepingCapacity: true)
+        if logEntries.count > Self.maxLogEntries {
+            logEntries.removeFirst(logEntries.count - Self.maxLogEntries)
+        }
+    }
+
+    private func ensureLogFlushLoopRunning() {
+        guard logFlushTask == nil else { return }
+        logFlushTask = Task { [weak self] in
+            while true {
+                try? await Task.sleep(nanoseconds: 200_000_000)
+                guard let self else { return }
+                self.flushPendingLogEntries()
+            }
+        }
+    }
+
+    private func handleTransferDetection(in line: String) {
         guard case .filenameDetected(let pid, let filename) = TransferActivityParser.parse(line: line) else { return }
         guard activeTransfers[pid] == nil else { return }
 
@@ -394,23 +528,42 @@ final class AppState: ObservableObject {
 
     /// Fuente única de verdad para una transferencia activa: progreso real,
     /// dirección y fin, todo leído de `nettop` (bytes reales enviados/
-    /// recibidos por ESE proceso específico, sin sudo porque corre como el
-    /// usuario actual). `tftpd` no expone esto por log ni API — verificado en
-    /// vivo (2026-09-05). RRQ (descarga) = tftpd envía datos → `bytesOut`
-    /// grande; WRQ (subida) = tftpd recibe datos → `bytesIn` grande. Una
-    /// tarea independiente por PID permite trackear transferencias
-    /// simultáneas de verdad (confirmado en vivo, 2026-09-07: dos `tftpd`
-    /// corriendo a la vez sirviendo archivos distintos).
+    /// recibidos por ESE proceso específico). `tftpd` no expone esto por log
+    /// ni API — verificado en vivo (2026-09-05). RRQ (descarga) = tftpd
+    /// envía datos → `bytesOut` grande; WRQ (subida) = tftpd recibe datos →
+    /// `bytesIn` grande. Una tarea independiente por PID permite trackear
+    /// transferencias simultáneas de verdad (confirmado en vivo,
+    /// 2026-09-07: dos `tftpd` corriendo a la vez sirviendo archivos
+    /// distintos).
+    ///
+    /// Bug real encontrado en vivo (2026-09-08): terminar la tarea cuando
+    /// `NetworkByteMonitor.byteCounts` deja de devolver datos asumía que
+    /// eso solo pasa cuando el proceso murió — pero con `tftpd` corriendo
+    /// como root (ver `NativeTFTPService.plistContents`), `nettop -p <pid>`
+    /// puede seguir devolviendo *algo* que pasa el parseo mucho después de
+    /// que ese PID específico ya no existe. Confirmado en vivo tras una
+    /// sesión larga de pruebas: transferencias quedaron "Detecting" con el
+    /// cronómetro subiendo por más de 3 minutos sin que hubiera un solo
+    /// `tftpd` vivo — cada tarea huérfana seguía lanzando un `nettop` nuevo
+    /// cada 150ms para siempre, acumulándose con las de pruebas anteriores
+    /// hasta saturar el hilo principal (100% CPU sostenido, ventana sin
+    /// responder). `ProcessLiveness.isAlive` pregunta directamente al
+    /// kernel si el PID existe (`kill(pid, 0)`, sin enviar ninguna señal
+    /// real) — es la única señal de "terminó" en la que se puede confiar
+    /// aquí; los datos de `nettop` ahora son solo progreso "best effort"
+    /// mientras el proceso sigue vivo, nunca la condición de salida.
     private func trackTransfer(pid: Int32, knownDownloadSize: Int64?) {
         trackingTasks[pid]?.cancel()
         trackingTasks[pid] = Task { [weak self] in
             while !Task.isCancelled {
                 guard let self else { return }
-                guard let counts = await NetworkByteMonitor.byteCounts(forPID: pid) else {
-                    self.finalizeTransfer(pid: pid)
+                guard ProcessLiveness.isAlive(pid: pid) else {
+                    self.finalizeTransfer(pid: pid, knownDownloadSize: knownDownloadSize)
                     return
                 }
-                self.updateTransfer(pid: pid, counts: counts, knownDownloadSize: knownDownloadSize)
+                if let counts = await NetworkByteMonitor.byteCounts(forPID: pid) {
+                    self.updateTransfer(pid: pid, counts: counts, knownDownloadSize: knownDownloadSize)
+                }
                 try? await Task.sleep(nanoseconds: 150_000_000)
             }
         }
@@ -480,7 +633,20 @@ final class AppState: ObservableObject {
     /// subidas de ~1GB terminando en <1s). Si eso pasa, se resuelve aquí con
     /// el último conteo conocido, sin exigir el margen de 2x — al terminar el
     /// proceso, cualquier byte movido ya identifica la dirección real.
-    private func finalizeTransfer(pid: Int32) {
+    ///
+    /// Bug real encontrado en vivo (2026-09-08, portado desde la versión
+    /// base): con 50 transferencias de archivos diminutos (21 bytes)
+    /// seguidas, TODAS quedaron atascadas para siempre en el panel
+    /// "Detecting" — nunca se resolvió su dirección. La causa: un archivo tan
+    /// pequeño se transfiere y el proceso `tftpd` termina antes de que el
+    /// primer sondeo de `nettop` (cada 150ms en `trackTransfer`) alcance a
+    /// tomar una sola muestra, así que `lastByteCounts[pid]` nunca se llena
+    /// — el respaldo de arriba (que compara bytesOut/bytesIn) no tiene con
+    /// qué trabajar. Segundo respaldo: si el archivo ya existía en el TFTP
+    /// root al detectar la transferencia (`knownDownloadSize` no nulo), es
+    /// casi seguro una descarga — nadie pide leer un archivo por su nombre
+    /// para luego escribirlo con ese mismo comando.
+    private func finalizeTransfer(pid: Int32, knownDownloadSize: Int64? = nil) {
         guard var transfer = activeTransfers[pid], transfer.status == .inProgress else { return }
 
         if transfer.direction == nil, let counts = lastByteCounts[pid], counts.bytesOut != counts.bytesIn {
@@ -492,6 +658,12 @@ final class AppState: ObservableObject {
                 transfer.transferredBytes = counts.bytesIn
                 transfer.totalBytes = nil // ver nota en `updateTransfer`
             }
+        }
+
+        if transfer.direction == nil, let knownDownloadSize {
+            transfer.direction = .download
+            transfer.transferredBytes = knownDownloadSize
+            transfer.totalBytes = knownDownloadSize
         }
 
         transfer.status = .completed

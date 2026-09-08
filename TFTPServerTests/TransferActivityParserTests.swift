@@ -30,4 +30,35 @@ final class TransferActivityParserTests: XCTestCase {
         XCTAssertNil(TransferActivityParser.parse(line: "tftpd[38082:17258d] Mode: 'octet'"))
         XCTAssertNil(TransferActivityParser.parse(line: "Some unrelated log line"))
     }
+
+    /// Formato real del `tftpd` de macOS 13 Ventura (bug real encontrado en
+    /// vivo, 2026-09-08): sin este caso, el parser solo reconocía el formato
+    /// de Tahoe y nunca detectaba ninguna transferencia en Ventura.
+    func testParsesVenturaReadRequestLine() {
+        let event = TransferActivityParser.parse(
+            line: "2026-09-08 14:02:56.720 I  tftpd[15662:119fac] 10.4.200.143: read request for /private/tmp/tftproot/neutro.txt: success"
+        )
+        guard case .filenameDetected(let pid, let filename) = event else {
+            return XCTFail("Expected .filenameDetected, got \(String(describing: event))")
+        }
+        XCTAssertEqual(pid, 15662)
+        XCTAssertEqual(filename, "neutro.txt")
+    }
+
+    func testParsesVenturaWriteRequestLine() {
+        let event = TransferActivityParser.parse(
+            line: "2026-09-08 14:07:32.162 I  tftpd[16653:11b60b] 10.4.200.143: write request for /private/tmp/tftproot/subida-check.txt: success"
+        )
+        guard case .filenameDetected(let pid, let filename) = event else {
+            return XCTFail("Expected .filenameDetected, got \(String(describing: event))")
+        }
+        XCTAssertEqual(pid, 16653)
+        XCTAssertEqual(filename, "subida-check.txt")
+    }
+
+    func testIgnoresVenturaFailureLines() {
+        XCTAssertNil(TransferActivityParser.parse(
+            line: "tftpd[12564:115250] 10.4.200.143: read request for testfinal.txt: File not found"
+        ))
+    }
 }

@@ -77,4 +77,53 @@ final class PathValidatorTests: XCTestCase {
 
         XCTAssertTrue(PathValidator.isValidRoot(base))
     }
+
+    /// Bug real encontrado en vivo (2026-09-08), diagnóstico corregido tras
+    /// una hipótesis inicial equivocada (TCC): una carpeta TFTP dentro de la
+    /// carpeta personal del usuario (`750` por defecto en macOS) pasa
+    /// `isValidRoot` pero `tftpd`, corriendo como `nobody` tras bajar sus
+    /// propios privilegios, no puede ni atravesarla — ver
+    /// `PathValidator.firstAncestorBlockingOtherTraversal`.
+    func testDetectsAncestorMissingOtherExecuteBit() throws {
+        let fileManager = FileManager.default
+        // Base bajo `/private/tmp` (`1777`), no bajo
+        // `FileManager.default.temporaryDirectory` — esa resuelve a la
+        // carpeta temporal privada por usuario de macOS (`/var/folders/.../T`,
+        // `700`), que bloquearía el tránsito ella misma antes de llegar a la
+        // carpeta sintética de esta prueba, dando un falso positivo.
+        let base = URL(fileURLWithPath: "/private/tmp")
+            .appendingPathComponent("PathValidatorTests-\(UUID().uuidString)")
+        let blockedHome = base.appendingPathComponent("home-no-x-for-other")
+        let tftpFolder = blockedHome.appendingPathComponent("TFTP")
+        try fileManager.createDirectory(at: tftpFolder, withIntermediateDirectories: true)
+        defer {
+            try? fileManager.setAttributes([.posixPermissions: 0o755], ofItemAtPath: blockedHome.path)
+            try? fileManager.removeItem(at: base)
+        }
+
+        // Simula una carpeta de usuario típica de macOS: rwx para el dueño,
+        // r-x para el grupo, nada para "otros" — el mismo `750` real que
+        // bloqueaba las transferencias.
+        try fileManager.setAttributes([.posixPermissions: 0o750], ofItemAtPath: blockedHome.path)
+
+        XCTAssertEqual(
+            PathValidator.firstAncestorBlockingOtherTraversal(tftpFolder, fileManager: fileManager)?.standardizedFileURL.path,
+            blockedHome.standardizedFileURL.path
+        )
+
+        // Arreglado (equivalente a `FileSystemService.repairOtherTraversal`):
+        // ya no debe detectar ningún bloqueo.
+        try fileManager.setAttributes([.posixPermissions: 0o751], ofItemAtPath: blockedHome.path)
+        XCTAssertNil(PathValidator.firstAncestorBlockingOtherTraversal(tftpFolder, fileManager: fileManager))
+    }
+
+    func testAllowsFullyTraversableChain() {
+        // `/private/tmp` (y todo lo que hay arriba: "/", "/private") tiene
+        // el bit de ejecución para "otros" en cualquier macOS real — es
+        // justo la carpeta que sí funcionó en las pruebas en vivo. Ojo:
+        // `FileManager.default.temporaryDirectory` NO sirve para esta
+        // prueba — resuelve a la carpeta temporal privada por usuario
+        // (`/var/folders/.../T`, `700`), que SÍ bloquea el tránsito.
+        XCTAssertNil(PathValidator.firstAncestorBlockingOtherTraversal(URL(fileURLWithPath: "/private/tmp")))
+    }
 }

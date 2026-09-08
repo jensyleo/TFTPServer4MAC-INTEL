@@ -46,6 +46,24 @@ struct PermissionsNeededView: View {
                         appState.repairParentFolderPermissions()
                     }
                 }
+                // Bug real encontrado en vivo (2026-09-08): una carpeta
+                // dentro de la carpeta personal del usuario (`750` por
+                // defecto en macOS) puede pasar las dos verificaciones de
+                // arriba y aun así fallar en cada transferencia real —
+                // `tftpd`, corriendo como `nobody` tras bajar sus propios
+                // privilegios, no puede ni atravesar esa carpeta para llegar
+                // a la elegida. Ver `PathValidator.firstAncestorBlockingOtherTraversal`.
+                if let ancestor = appState.ancestorBlockingTraversal {
+                    VStack(alignment: .leading, spacing: 6) {
+                        permissionRow(title: "Folder access blocked by \"\(ancestor.lastPathComponent)\"") {
+                            appState.repairAncestorTraversal()
+                        }
+                        Text("\(ancestor.path) doesn't allow other users to pass through it, so the server (which runs as a low-privilege system account for security) can never reach your TFTP folder inside it — every transfer will time out. \"Fix\" only adds pass-through access to this one folder, not read or listing access to its contents.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
             }
 
             Button("Not Now") {

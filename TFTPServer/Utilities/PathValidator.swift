@@ -81,4 +81,57 @@ enum PathValidator {
         // si el servidor puede arrancar de verdad con lo que hay ahí.
         return true
     }
+
+    /// Devuelve el primer ancestro de `url` (empezando por "/" y bajando)
+    /// que le falta el bit de ejecución para "otros" — o `nil` si toda la
+    /// cadena hasta `url` inclusive lo tiene.
+    ///
+    /// Bug real encontrado en vivo (2026-09-08), diagnóstico corregido tras
+    /// una hipótesis inicial equivocada (TCC — descartada con evidencia:
+    /// `log stream` sobre `tccd` durante el intento no mostró ninguna
+    /// actividad). La causa real, confirmada con `log stream --level debug`
+    /// sobre `tftpd`, es mucho más simple: el propio `tftpd` (corriendo como
+    /// root gracias al fix de `NativeTFTPService.plistContents`) baja sus
+    /// privilegios internamente a `nobody` por cada petición — visible en el
+    /// log como `running as user 'nobody' (-2)` — y para macOS, `nobody` es
+    /// simplemente "otro usuario" frente a cualquier carpeta que no le
+    /// pertenezca. La carpeta personal de un usuario (`/Users/<usuario>`) es
+    /// `750` por defecto en macOS (sin ningún permiso para "otros"), así que
+    /// `nobody` no puede ni atravesarla — sin importar los permisos de la
+    /// subcarpeta TFTP en sí, que nunca llega a alcanzarse. Confirmado
+    /// comparando la cadena completa de permisos: `/`, `/Users`,
+    /// `/private`, `/private/tmp` y `/Users/Shared` tienen el bit de
+    /// ejecución para "otros" (`755`/`1777`); solo `/Users/<usuario>` (`750`)
+    /// no lo tiene — coincide exactamente con qué carpetas funcionan y
+    /// cuáles no.
+    ///
+    /// A diferencia del diagnóstico de TCC (que no tenía arreglo posible
+    /// desde la app), este sí es corregible: agregar el bit de ejecución
+    /// para "otros" en la carpeta bloqueante NO concede lectura ni listado
+    /// — solo permite "pasar a través" de ella para llegar a una ruta ya
+    /// conocida, exactamente lo mínimo que `tftpd` necesita.
+    static func firstAncestorBlockingOtherTraversal(
+        _ url: URL,
+        fileManager: FileManager = .default
+    ) -> URL? {
+        var chain: [URL] = []
+        var current = url.standardizedFileURL
+        while current.path != "/" {
+            chain.append(current)
+            current = current.deletingLastPathComponent()
+        }
+        chain.append(current) // "/" en sí también debe tener el bit.
+
+        for ancestor in chain.reversed() {
+            guard let attributes = try? fileManager.attributesOfItem(atPath: ancestor.path),
+                  let posixPermissions = (attributes[.posixPermissions] as? NSNumber)?.intValue else {
+                continue
+            }
+            let otherExecuteBit = 0o001
+            if posixPermissions & otherExecuteBit == 0 {
+                return ancestor
+            }
+        }
+        return nil
+    }
 }

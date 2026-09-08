@@ -18,6 +18,7 @@ enum TFTPServiceError: Error, Equatable {
     case firewallIssue
     case permissionsRepairFailed
     case permissionsMustBeFixedFirst
+    case cannotChangePathWhileRunning
     case unknown
 
     var userFacingMessage: String {
@@ -44,6 +45,8 @@ enum TFTPServiceError: Error, Equatable {
             return "Couldn't fix this folder's permissions — it may belong to a different user. Try fixing it from Terminal or Finder's Get Info panel."
         case .permissionsMustBeFixedFirst:
             return "The server can't start until the permission issues shown below are fixed. Use the \"Fix\" button next to whichever one says \"Fix needed\", then try Start again."
+        case .cannotChangePathWhileRunning:
+            return "Stop the server before changing the TFTP folder. The running daemon keeps serving the previous folder until it's restarted, so changing the path here without stopping first would silently have no effect."
         case .unknown:
             return "An unknown error occurred."
         }
