@@ -2,6 +2,18 @@
 
 All notable changes to this project are documented in this file.
 
+## [1.1.0] - 2026-11-16
+
+Ported from the base (Apple Silicon) version's v1.1.0.
+
+### Added
+
+- The chosen TFTP folder and the "Show Client IP" setting are now remembered between launches. If the saved folder no longer exists or is no longer a valid root, the app falls back to the default. Stored in this build's own preferences domain (`com.jensyleo.tftpserver-intel`), so it doesn't touch the base version's saved settings.
+
+### Fixed
+
+- A download that ended with clearly fewer bytes than the file's size (for example, the client aborting midway) was reported as "Completed". It is now marked as incomplete, showing the percentage that was actually sent.
+
 ## [1.0.1] - 2026-09-08
 
 ### Fixed

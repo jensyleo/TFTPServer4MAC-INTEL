@@ -21,11 +21,17 @@ TFTP is still the standard way to push firmware and configuration files to netwo
 - **Genuine concurrent transfers** — the native daemon really does serve more than one device at once; each active transfer gets its own card with real, independent progress, speed, and a Cancel button, in two separate panels for downloads and uploads.
 - **Real transfer progress** — live percentage, speed, and estimated time remaining, read directly from the transferring process's actual network bytes (not simulated).
 - **Optional client IP display** — see which device made each request, captured narrowly (only the first packet of each request) and folded into the same one-time authorization as Start.
-- **Cancel without re-authorizing** — the transfer process runs as your own user, not root, so cancelling is instant.
-- **Folder permission repair** — a one-click "Fix" for the most common setup mistake (an unreadable TFTP folder or parent), with no extra authorization needed.
+- **Cancel needs the same authorization as Start/Stop** — the native `tftpd` has to run as root while the server is active (it drops its own privileges per request), so stopping a transfer asks for the one-time macOS administrator authorization.
+- **Incomplete downloads are flagged** — a download that ends well short of the file's size (for example, the client aborted midway) is shown as failed with the percentage actually sent, instead of "Completed".
+- **Remembers your setup** — the chosen TFTP folder and the Client IP setting are restored on the next launch.
+- **Folder permission repair** — a one-click "Fix" for the most common setup mistake (an unreadable TFTP folder or parent), with no extra authorization needed. Folders inside your home folder get a one-time pass-through fix too (the server runs as a low-privilege account that can't otherwise cross your home folder's default permissions).
 - **Orphaned-server protection** — if the app is force-quit while the server is running, the next launch requires you to explicitly stop the leftover daemon before continuing.
 - **Transfer history** — a running log of every transfer this session: filename, direction, client IP, size, status, duration.
 - **Built-in Help** — a searchable in-app Help window covering usage, security, and the relevant parts of the TFTP protocol (RFC 1350 and its extensions).
+
+## Download
+
+Download the latest `.dmg` (or `.zip`) from the [Releases page](https://github.com/jensyleo/TFTPServer4MAC-INTEL/releases/latest), open it, and drag `TFTPServer.app` to Applications. The app is not notarized, so on first launch right-click it and choose Open.
 
 ## Requirements
 
